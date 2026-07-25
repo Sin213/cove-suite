@@ -379,7 +379,13 @@
   document.getElementById('foxy-tabs')?.addEventListener('click', (e) => {
     const closeBtn = e.target.closest('[data-close-tab]');
     if (closeBtn) {
-      closeTab(closeBtn.dataset.closeTab);
+      const closedId = closeBtn.dataset.closeTab;
+      closeTab(closedId);
+      // Tell main to tear the hosted view down. Without this the view (and any
+      // tab_ready still in flight) outlives the tab it belonged to.
+      if (IS_DESKTOP && state.processes[closedId]?.openMode === 'tab-web') {
+        try { coveAPI.closeTabWeb(closedId); } catch {}
+      }
       renderTabs();
       renderToolSession();
       return;
@@ -1797,6 +1803,14 @@
         const snapshot = await coveAPI.processList();
         if (snapshot && typeof snapshot === 'object') state.processes = snapshot;
       } catch {}
+      // Files a hosted (Foxy tab) app downloads are saved by main; surface
+      // where they landed so an in-tab export isn't silent.
+      coveAPI.onHostedDownload?.(({ slug, ok, filename, dir } = {}) => {
+        const prog = (window.PROGRAMS || []).find(p => p.slug === slug);
+        const name = prog?.name || slug || 'App';
+        if (ok) toast(`${name} saved ${filename} to ${dir || 'Downloads'}.`, 'success');
+        else toast(`${name} download failed.`, 'error');
+      });
       coveAPI.onProcessUpdate(({ slug, previousStatus, state: s } = {}) => {
         if (slug && s && typeof s === 'object') {
           state.processes[slug] = s;

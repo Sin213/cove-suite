@@ -12,6 +12,8 @@ const {
   matchAsset, detectSlugFromFilename, isNewerSemver,
   listArtifactsFromNames, planReconcile,
 } = require('./lib/reconcile');
+const { uniqueDownloadPath } = require('./lib/downloads');
+const { tabReadyDecision, canResumeHostedView } = require('./lib/tabweb');
 
 const APP_ID = 'cove-nexus';
 const GITHUB_OWNER = 'Sin213';
@@ -1336,6 +1338,7 @@ function handleProtocolMessage(slug, msg) {
     notification: null,
     tabUrl: null,
     tabFallback: false,
+    tabClosed: false,
   };
 
   proto.connected = true;
@@ -1400,13 +1403,13 @@ function handleProtocolMessage(slug, msg) {
       break;
 
     case 'tab_ready': {
-      if (typeof msg.url !== 'string') return;
-      if (!isValidTabUrl(msg.url)) return;
-      if (entry.openMode !== 'tab-web') return;
-      if (proto.tabUrl || proto.tabFallback) return; // ignore duplicate or post-fallback/close
+      const decision = tabReadyDecision(entry, proto, msg.url, isValidTabUrl);
+      if (decision === 'ignore') return;
       proto.tabUrl = msg.url;
       clearTabReadyTimer(slug);
-      createHostedView(slug, msg.url);
+      // 'record': the tab was closed while the app was still starting, so
+      // remember the URL for a later reopen but build no view nobody can see.
+      if (decision === 'attach') createHostedView(slug, msg.url);
       break;
     }
 
@@ -1540,11 +1543,84 @@ function createHostedView(slug, url) {
   view.webContents.on('will-navigate', guardNav);
   view.webContents.on('will-redirect', guardNav);
   view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  wireHostedDownloads(view.webContents.session);
   hostedViews.set(slug, view);
   view.webContents.loadURL(url);
 }
 
-function destroyHostedView(slug) {
+// A WebContentsView has no owning BrowserWindow, so Electron's default
+// save-as prompt can never be shown for it: a download started inside a
+// hosted tab (e.g. Meme Maker's "Export PNG", an <a download> click) stalls
+// in 'progressing' forever and no file is ever written. Pick the save path
+// ourselves — Downloads, de-duplicated — and tell the renderer so the user
+// learns where the file landed.
+let hostedDownloadsWired = false;
+const pendingDownloadPaths = new Set(); // save paths claimed by in-flight downloads
+function wireHostedDownloads(session) {
+  if (hostedDownloadsWired) return;
+  hostedDownloadsWired = true;
+
+  session.on('will-download', (_event, item, webContents) => {
+    const slug = slugForHostedContents(webContents);
+    if (!slug) return; // not a hosted tab: leave default handling alone
+
+    let dir;
+    try {
+      dir = app.getPath('downloads');
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {
+      return; // no usable downloads dir: fall back to default handling
+    }
+
+    // A path is "taken" if it exists on disk OR another download is already
+    // headed there: two same-name downloads started before either file is
+    // created would otherwise be handed the identical path.
+    const taken = (p) => pendingDownloadPaths.has(p) || exists(p);
+    const savePath = uniqueDownloadPath(dir, item.getFilename(), taken);
+    pendingDownloadPaths.add(savePath);
+    item.setSavePath(savePath);
+
+    item.once('done', (_e, state) => {
+      pendingDownloadPaths.delete(savePath);
+      try {
+        mainWindow?.webContents.send('cove:hosted:download', {
+          slug,
+          ok: state === 'completed',
+          path: state === 'completed' ? savePath : null,
+          filename: path.basename(savePath),
+          dir,
+        });
+      } catch { /* window may be gone */ }
+    });
+  });
+}
+
+// Rebuild the hosted view for a paused session (tab closed, app still alive).
+// No-op unless the slug is a live tab-web run that reported a URL.
+function resumeHostedView(slug) {
+  const e = processRegistry.get(slug);
+  if (!canResumeHostedView(e, isValidTabUrl)) return;
+
+  createHostedView(slug, e.protocol.tabUrl);
+  const proto = { ...e.protocol, tabClosed: false };
+  processRegistry.set(slug, { ...e, protocol: proto, processUpdatedAt: Date.now() });
+  broadcastProcessUpdate(slug, e.status);
+}
+
+function slugForHostedContents(webContents) {
+  if (!webContents) return null;
+  for (const [slug, view] of hostedViews) {
+    if (view.webContents.isDestroyed()) continue;
+    if (view.webContents.id === webContents.id) return slug;
+  }
+  return null;
+}
+
+// keepUrl: the session is only paused (tab closed while the app keeps
+// running), so the URL is retained and the view is rebuilt from it when the
+// user reopens the tab. Without keepUrl the URL is cleared, which is what a
+// dead process or a real teardown wants.
+function destroyHostedView(slug, { keepUrl = false } = {}) {
   const view = hostedViews.get(slug);
   if (!view) return;
   hostedViews.delete(slug);
@@ -1555,6 +1631,7 @@ function destroyHostedView(slug) {
   try {
     if (!view.webContents.isDestroyed()) view.webContents.close();
   } catch { /* best-effort */ }
+  if (keepUrl) return;
   // Clear stale tabUrl so the renderer knows this view is gone.
   const e = processRegistry.get(slug);
   if (e?.protocol?.tabUrl != null) {
@@ -2284,6 +2361,10 @@ ipcMain.handle('cove:launch', async (_e, slug, rawOpenMode) => {
 
 ipcMain.handle('cove:tab-web:show', (_e, slug, bounds) => {
   if (!isValidSlug(slug)) return;
+  // Reopening a tab that was closed while its app kept running: rebuild the
+  // view from the URL the app already reported.
+  if (!hostedViews.has(slug)) resumeHostedView(slug);
+
   const view = hostedViews.get(slug);
   if (!view || view.webContents.isDestroyed()) return;
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -2368,11 +2449,15 @@ ipcMain.handle('cove:tab-web:close', (_e, slug) => {
       projectLabel: null, progress: null, progressLabel: null,
       lifecycle: null, notification: null,
     };
-    const proto = { ...base, tabUrl: null, tabFallback: true };
+    // The app keeps running (v5 MVP: tab close detaches, it does not kill),
+    // so keep the URL and mark the session paused. Reopening the tab rebuilds
+    // the view from this URL; a tab_ready still in flight is recorded but
+    // does not create a view.
+    const proto = { ...base, tabClosed: true };
     processRegistry.set(slug, { ...e, protocol: proto, processUpdatedAt: Date.now() });
     broadcastProcessUpdate(slug, e.status);
   }
-  destroyHostedView(slug); // removes view + skips tabUrl broadcast (already null above)
+  destroyHostedView(slug, { keepUrl: true });
   // dev-only: stop smoke server and mark exited so re-launch is possible
   if (!app.isPackaged && slug === 'tab-web-smoke') {
     stopSmokeServer(slug);

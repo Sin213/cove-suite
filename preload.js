@@ -31,6 +31,12 @@ contextBridge.exposeInMainWorld('coveAPI', {
     return () => ipcRenderer.removeListener('cove:install:progress', h);
   },
 
+  onHostedDownload: (cb) => {
+    const h = (_e, payload) => cb(payload);
+    ipcRenderer.on('cove:hosted:download', h);
+    return () => ipcRenderer.removeListener('cove:hosted:download', h);
+  },
+
   processList: () => ipcRenderer.invoke('cove:process:list'),
   processFocus: (slug) => ipcRenderer.invoke('cove:process:focus', slug),
   onProcessUpdate: (cb) => {
